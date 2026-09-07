@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+
+# SQLite database — local dev data, never commit it.
+# (-shm and -wal are SQLite's shared-memory and write-ahead-log sidecar files.)
+*.db
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
+
+# Note: appsettings.Development.json is NOT ignored, because it holds no secrets.
+# Jwt:Key lives in user-secrets (~/.microsoft/usersecrets/), outside the repo entirely.

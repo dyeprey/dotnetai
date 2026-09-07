@@ -1,0 +1,14 @@
+# Build artefacts — these are rebuilt inside the image, and copying host output in
+# would poison the container with binaries built for the host's OS and architecture.
+**/bin/
+**/obj/
+**/out/
+
+# Local dev data. The deployed database lives on a Docker volume at /data, never in the image.
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+.vs/
+.idea/
+.DS_Store

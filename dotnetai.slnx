@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="dotnetai.Api.Tests/dotnetai.Api.Tests.csproj" />
+  <Project Path="dotnetai.Api/dotnetai.Api.csproj" />
+</Solution>
