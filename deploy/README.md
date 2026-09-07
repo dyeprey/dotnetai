@@ -64,42 +64,54 @@ The two sides name each other, which is the easiest thing in this deploy to get 
 | | |
 |---|---|
 | Image | Ubuntu 24.04 LTS |
-| Size | 1 GB is enough |
-| Options | Enable the DigitalOcean VPC firewall, then open ports 22, 80, 443 |
+| Size | 512 MB / 1 vCPU works — **add swap** (bootstrap.sh does) |
+| Options | Open ports 22, 80 and 443 in the DigitalOcean firewall |
 
-> **Why 1 GB is now fine.** The droplet never builds anything — GitHub Actions does that
-> and the droplet pulls the finished image. Running the API, Caddy and SQLite fits
-> comfortably. (If you ever go back to building on the droplet, you need 2 GB or swap:
-> `dotnet publish` peaks well above 512 MB and the OOM killer takes the build down with an
-> error that blames neither.)
+> **On 512 MB, swap is not optional.** The API measures ~31 MB steady-state and Caddy ~20 MB,
+> so it fits — but without swap the first memory spike does not slow the box down, it kills
+> a process. The OOM killer picks the largest RSS, which is the API, so the symptom is "the
+> API randomly disappears" with nothing in its own logs, because it never got to write any.
+>
+> Port 80 is required even though the site is HTTPS-only: that is where Let's Encrypt
+> performs its challenge.
 
 ## 2. Point DNS at it
 
 An **A record** for the API's subdomain → the droplet's IPv4 address. Let it propagate
-before step 5: Caddy proves domain ownership over ports 80 and 443 the first time it starts,
-and if the record is not live yet, issuance fails and you wait out a retry backoff.
+before you deploy: Caddy proves domain ownership over ports 80 and 443 the first time it
+starts, and if the record is not live yet, issuance fails and you wait out a retry backoff.
 
 ```bash
 dig +short api.example.com    # must print the droplet's IP before you continue
 ```
 
-## 3. Install Docker on the droplet
+You can skip this for a first smoke test by setting `API_DOMAIN=:80` and hitting the bare
+IP — but the Firebase-hosted SPA cannot talk to an HTTP API (mixed content), so a real
+deployment needs the domain.
+
+## 3. Bootstrap the droplet (once)
 
 ```bash
-ssh root@<droplet-ip>
-curl -fsSL https://get.docker.com | sh
+ssh jeffrey@<droplet-ip>
+curl -fsSL https://raw.githubusercontent.com/dyeprey/dotnetai/main/deploy/bootstrap.sh | bash
 ```
 
-## 4. Get the code and configure it
+That adds 2 GB of swap (with `vm.swappiness=10`, so swap stays a safety net rather than a
+routine tier of memory), installs Docker, puts you in the `docker` group, caps container
+log rotation so logs cannot fill a small disk, clones the repo to `/opt/dotnetai`, and
+creates `.env` from the template.
+
+**Log out and back in afterwards** — group membership only applies to new logins, and
+`deploy.sh` calls `docker` directly.
+
+## 4. Fill in .env
 
 ```bash
-git clone git@github.com:dyeprey/dotnetai.git /opt/dotnetai
-cd /opt/dotnetai
-cp .env.example .env
+cd /opt/dotnetai && nano .env
 ```
 
-Everything the droplet needs — `docker-compose.yml`, `Dockerfile`, `deploy/Caddyfile` — is
-in this repository, so the clone is the whole deployment.
+Everything the droplet needs — `docker-compose.yml`, `deploy/Caddyfile`, `deploy/deploy.sh`
+— is in this repository, so the clone bootstrap.sh made is the whole deployment.
 
 Generate a signing key — at least 32 characters, because that is the minimum for
 HMAC-SHA256 and `JwtOptions` refuses to start on anything shorter:

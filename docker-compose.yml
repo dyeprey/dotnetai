@@ -131,6 +131,18 @@ services:
       retries: 5
       start_period: 20s
 
+    # A CEILING, so a runaway API cannot take Caddy and sshd down with it. .NET reads the
+    # cgroup limit and sizes its GC heap against it, so this shapes memory behaviour rather
+    # than merely capping the damage. Measured steady-state on this image is ~31 MB after
+    # 200 requests, so 300m is roomy; raise it if you resize the droplet.
+    #
+    # NOT PAIRED WITH DOTNET_gcServer=0, deliberately. The usual advice to force Workstation
+    # GC on small boxes assumes Server GC's per-core heaps are costing you memory - but this
+    # droplet has 1 vCPU, so Server GC allocates exactly one heap and the two modes measure
+    # identically (31.46 MB vs 31.45 MB under an identical 200-request warm-up). The setting
+    # would be cargo cult here. It starts to matter on a multi-core droplet.
+    mem_limit: 300m
+
     networks:
       - backend
 
