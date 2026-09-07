@@ -12,9 +12,19 @@ name: dotnetai
 # =============================================================================
 
 x-api-image: &api-image
-  image: dotnetai-api:latest
+  # PULLED FROM A REGISTRY, not built here. GitHub Actions builds this image on an amd64
+  # runner and pushes it to ghcr.io; the droplet only ever pulls. That solves two problems
+  # at once: your Mac is arm64 and the droplet is amd64, and a 2 GB droplet cannot run
+  # `dotnet publish` without swapping itself to death.
+  #
+  # IMAGE_TAG is how you pin and roll back. `latest` follows main; a specific
+  # `sha-<commit>` tag deploys or reverts to exactly one commit's build.
+  image: ${IMAGE:-ghcr.io/dyeprey/dotnetai-api}:${IMAGE_TAG:-latest}
+
+  # Kept so `docker compose build` still works on a dev machine. deploy.sh always passes
+  # --no-build, so the droplet can only ever run what the registry gave it — never a local
+  # build that silently differs from what CI tested.
   build:
-    # The repo root — this compose file now lives beside the Dockerfile it builds.
     context: .
     dockerfile: Dockerfile
 

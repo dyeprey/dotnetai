@@ -1,0 +1,153 @@
+name: build and deploy
+
+# Build on every push to main, and on demand. workflow_dispatch also lets you re-run a
+# deploy without an empty commit — useful when only a droplet-side setting changed.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'deploy/README.md'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # -> ghcr.io/dyeprey/dotnetai-api
+  IMAGE_NAME: ${{ github.repository }}-api
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # TESTS FIRST, and the build depends on them.
+  # ---------------------------------------------------------------------------
+  # The point of the ordering is not tidiness — it is that a failing test must not be able
+  # to produce an image. If the build ran in parallel, a red test suite would still push a
+  # green `latest` tag, and the next deploy would ship it.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release --verbosity normal
+
+  # ---------------------------------------------------------------------------
+  # BUILD AND PUSH THE IMAGE
+  # ---------------------------------------------------------------------------
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to push to ghcr.io using the automatic GITHUB_TOKEN. Without it the push
+      # fails with a 403 that reads like a credentials problem rather than a scope one.
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # Minted automatically for this run. No PAT to create, store, or rotate.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # TWO tags on every build, and both matter:
+          #   latest      — what the droplet follows by default
+          #   sha-<full>  — an immutable handle on this exact commit's image, which is what
+          #                 makes `IMAGE_TAG=sha-... ./deploy/deploy.sh` a real rollback
+          #                 rather than a hope that `latest` still points where you think.
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # AMD64 ONLY, matching a standard DigitalOcean droplet. This is the whole reason
+          # to build in CI: the runner is already the target architecture, so there is no
+          # emulation and no `exec format error` on the droplet. Add linux/arm64 here if you
+          # ever move to an ARM droplet — but expect the build to take several times longer,
+          # because the second architecture runs under QEMU.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache in GitHub's own store. Without it every run re-runs `dotnet restore`
+          # and the full publish from scratch.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "digest: \`${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # DEPLOY TO THE DROPLET (opt-in)
+  # ---------------------------------------------------------------------------
+  # Skipped unless you set the repository variable DEPLOY_ENABLED=true. That default keeps
+  # the workflow green before the droplet secrets exist — build-and-push works on its own,
+  # and you turn on automatic deployment when you are ready for it.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: vars.DEPLOY_ENABLED == 'true'
+    concurrency:
+      # Never let two deploys touch the droplet at once. The second would race the first
+      # through the migration step, against a single-writer SQLite file.
+      group: droplet-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DROPLET_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DROPLET_HOST }}
+          USER: ${{ secrets.DROPLET_USER }}
+          APP_DIR: ${{ vars.DROPLET_APP_DIR || '/opt/dotnetai' }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY"     > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # PINNED HOST KEY rather than StrictHostKeyChecking=no. Disabling the check would
+          # make this job accept any server answering on that address — which is precisely
+          # the machine you are handing a deploy key to.
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes "$USER@$HOST" \
+            "cd '$APP_DIR' && IMAGE_TAG='sha-${{ github.sha }}' ./deploy/deploy.sh"

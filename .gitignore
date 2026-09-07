@@ -19,5 +19,6 @@ obj/
 .env
 .env.local
 
-# Database backups produced by the command in deploy/README.md.
+# Database backups. deploy.sh writes one here before every migration.
 dotnetai-*.db
+backups/

@@ -64,17 +64,14 @@ The two sides name each other, which is the easiest thing in this deploy to get 
 | | |
 |---|---|
 | Image | Ubuntu 24.04 LTS |
-| Size | **2 GB RAM minimum** |
+| Size | 1 GB is enough |
 | Options | Enable the DigitalOcean VPC firewall, then open ports 22, 80, 443 |
 
-> **Why 2 GB.** The 1 GB droplet is enough to *run* the API but not to *build* it —
+> **Why 1 GB is now fine.** The droplet never builds anything — GitHub Actions does that
+> and the droplet pulls the finished image. Running the API, Caddy and SQLite fits
+> comfortably. (If you ever go back to building on the droplet, you need 2 GB or swap:
 > `dotnet publish` peaks well above 512 MB and the OOM killer takes the build down with an
-> error that blames neither. If you are set on the 1 GB size, add swap first:
->
-> ```bash
-> fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-> echo '/swapfile none swap sw 0 0' >> /etc/fstab
-> ```
+> error that blames neither.)
 
 ## 2. Point DNS at it
 
@@ -131,25 +128,44 @@ OPENAI_API_KEY=sk-...
 chmod 600 .env      # it holds the signing key and the OpenAI key
 ```
 
-## 5. Build and start
+## 5. First deploy
 
-```bash
-docker compose up -d --build --wait
+The image is **built by GitHub Actions on an amd64 runner and pushed to ghcr.io**. The
+droplet only ever pulls. That is what removes the two constraints you would otherwise be
+fighting: your Mac is arm64 and the droplet is amd64, and a 2 GB droplet cannot run
+`dotnet publish` without swapping itself to death.
+
+Push the workflow once and let the first build finish (Actions tab → *build and deploy*).
+It produces two tags:
+
+```
+ghcr.io/dyeprey/dotnetai-api:latest
+ghcr.io/dyeprey/dotnetai-api:sha-<full commit sha>
 ```
 
-> **Build on the droplet, not on your Mac.** Apple Silicon builds `arm64` images;
-> DigitalOcean's standard droplets are `amd64`, and an image of the wrong architecture dies
-> at `exec format error`. Building on the target machine sidesteps the question. To build
-> locally and push to a registry instead, cross-build explicitly:
->
-> ```bash
-> docker buildx build --platform linux/amd64 -t <registry>/dotnetai-api:latest . --push
-> ```
+### Let the droplet pull the image
 
-`--wait` holds until every healthcheck passes, so the command failing means the deploy
-failed — worth having in any script that runs this.
+Packages on ghcr.io are **private by default**, so pick one:
 
-Confirm:
+**Public package** (simplest — the image is not secret, your `.env` is):
+GitHub → your profile → Packages → `dotnetai-api` → Package settings → Change visibility →
+Public. The droplet then needs no registry credentials at all.
+
+**Private package**: create a PAT with only the `read:packages` scope, then on the droplet:
+
+```bash
+echo '<the-PAT>' | docker login ghcr.io -u dyeprey --password-stdin
+```
+
+### Deploy
+
+```bash
+./deploy/deploy.sh
+```
+
+That is the whole deploy, and it is the same command forever after. It pulls the image,
+backs up the database, applies migrations, starts the API, verifies it over TLS, and
+**rolls back to the previous image if anything fails**.
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' https://api.example.com/auth/me
@@ -163,7 +179,39 @@ curl -si -X OPTIONS https://api.example.com/auth/me \
 ```
 
 If that second command prints nothing, the SPA will not work. Fix `WEB_ORIGIN` before
-moving on — it is much easier to diagnose here than from the browser.
+moving on — much easier to diagnose here than from the browser.
+
+## 6. Optional: deploy automatically on every push
+
+The workflow's `deploy` job SSHes into the droplet and runs `deploy.sh` for you. It is
+**skipped unless you opt in**, so the workflow stays green before any of this exists.
+
+Generate a key used for nothing else, so revoking it costs you nothing:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/dotnetai_deploy -C 'github-actions deploy' -N ''
+ssh-copy-id -i ~/.ssh/dotnetai_deploy.pub jeffrey@<droplet-ip>
+ssh-keyscan -H <droplet-ip>            # for DROPLET_KNOWN_HOSTS
+```
+
+Then in the repo — Settings → Secrets and variables → Actions:
+
+| | name | value |
+|---|---|---|
+| Secret | `DROPLET_SSH_KEY` | contents of `~/.ssh/dotnetai_deploy` (the **private** key) |
+| Secret | `DROPLET_KNOWN_HOSTS` | the `ssh-keyscan` output |
+| Secret | `DROPLET_HOST` | the droplet's IP or hostname |
+| Secret | `DROPLET_USER` | `jeffrey` |
+| Variable | `DEPLOY_ENABLED` | `true` |
+| Variable | `DROPLET_APP_DIR` | `/opt/dotnetai` (optional) |
+
+The job pins the host key from `DROPLET_KNOWN_HOSTS` rather than using
+`StrictHostKeyChecking=no`. That matters: disabling the check would make the job accept any
+machine answering on that address — which is exactly the machine you are handing a deploy
+key to.
+
+It deploys `sha-<commit>`, not `latest`, so what runs on the droplet is pinned to the
+commit that triggered it rather than to whatever `latest` meant by the time SSH connected.
 
 ---
 
@@ -230,15 +278,56 @@ stream rather than in one lump.
 
 ```bash
 # --- API (on the droplet) ---
-docker compose logs -f api             # application logs
-docker compose logs api-migrate        # exactly which migrations ran on the last deploy
-docker compose ps                      # health of each service
+./deploy/deploy.sh                      # deploy the newest build
+docker compose logs -f api              # application logs
+docker compose logs api-migrate         # exactly which migrations ran last deploy
+docker compose ps                       # health of each service
+```
 
-git pull && docker compose up -d --build --wait     # deploy a new version
+Pushing to `main` is the normal path: CI runs the 93 tests, builds the image only if they
+pass, and pushes it. Then either the `deploy` job runs `deploy.sh` for you, or you SSH in
+and run it yourself.
 
-# Back up the database — do this before any deploy that migrates
-docker compose run --rm -v "$PWD:/backup" --entrypoint sh api \
-  -c 'cp /data/dotnetai.db /backup/dotnetai-$(date +%F).db'
+### Rolling back
+
+Every build is tagged with its commit, so a rollback is a tag and a re-run — no rebuild
+anywhere, and no waiting on CI:
+
+```bash
+IMAGE_TAG=sha-<the-good-commit-sha> ./deploy/deploy.sh
+```
+
+To make it stick across future deploys, set `IMAGE_TAG` in `.env` instead of passing it
+inline; otherwise the next plain `./deploy/deploy.sh` returns you to `latest`.
+
+`deploy.sh` also rolls back **by itself** when a deploy fails its healthcheck — it re-tags
+the image that was running and brings it back, then exits non-zero. A failed migration
+therefore leaves you on the last good version rather than down.
+
+### What deploy.sh does, in order
+
+1. **Preflight** — docker, compose file, and `.env` with `JWT_KEY`, `OPENAI_API_KEY` and
+   `WEB_ORIGIN` actually set. Compose would fail on these anyway, but only *after* stopping
+   the running containers; checking first turns an outage into a no-op.
+2. **`git pull --ff-only`** — the image comes from the registry, but `docker-compose.yml`,
+   the Caddyfile and this script come from git. Skipped if the tree is dirty; `--ff-only`
+   so a diverged branch stops the deploy instead of silently merging.
+3. **Records the running image**, as the rollback target.
+4. **Pulls** — before stopping anything, so the outage is a container restart rather than a
+   registry download.
+5. **Backs up the database**, then applies migrations. Keeps the 10 newest in `backups/`.
+6. **`up -d --no-build --wait`** — `--no-build` is the guarantee the droplet runs exactly
+   what CI tested; `--wait` blocks until migrations exited 0 *and* the API is healthy.
+7. **Verifies over TLS** from outside, because the container healthcheck runs *inside* the
+   API container and proves nothing about Caddy routing, the certificate, or DNS.
+8. **Rolls back** if any of that failed.
+
+```bash
+# Ad-hoc database backup (deploy.sh does this automatically before each migration)
+docker compose stop api
+docker run --rm -v dotnetai_api-data:/data -v "$PWD:/backup" alpine:3 \
+  sh -c 'cp /data/dotnetai.db /backup/manual-$(date +%F).db'
+docker compose start api
 
 # --- SPA (from the separate my-react-app/ directory) ---
 npm run build && firebase deploy --only hosting
@@ -276,6 +365,22 @@ and the browser sees a redirect loop.
 that ports 80 and 443 are open in the DigitalOcean firewall, then `docker compose logs caddy`.
 Let's Encrypt allows **5 duplicate certificates per week**; the `caddy-data` volume exists so
 redeploys reuse the certificate you already have, so never delete that volume casually.
+
+**`docker compose pull` fails with `denied` or `unauthorized`.** The ghcr.io package is
+private and the droplet has no credentials. Either make the package public (Packages →
+Package settings → Change visibility) or `docker login ghcr.io` with a `read:packages` PAT.
+
+**The build job fails with `403` pushing to ghcr.io.** The workflow needs
+`permissions: packages: write`. It is set — but a repository- or org-level default of
+"read-only workflow permissions" overrides it. Settings → Actions → General → Workflow
+permissions.
+
+**`exec format error` when a container starts.** An arm64 image on an amd64 droplet. The
+workflow pins `platforms: linux/amd64`, so this means something was built and pushed by
+hand from an Apple Silicon machine. Re-run the workflow and redeploy.
+
+**The deploy job is skipped.** By design, until you set the repository variable
+`DEPLOY_ENABLED=true`. Build-and-push still runs; only the SSH step is gated.
 
 **`api-migrate` exits non-zero.** The API is not started — that is by design. Read
 `docker compose logs api-migrate`, fix the migration, redeploy. The old container keeps
