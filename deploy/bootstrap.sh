@@ -3,9 +3,15 @@
 # ONE-TIME droplet setup. Run once, on a fresh droplet, as a user with sudo:
 #
 #   ssh jeffrey@<droplet-ip>
-#   curl -fsSL https://raw.githubusercontent.com/dyeprey/dotnetai/main/deploy/bootstrap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/dyeprey/dotnetai/main/deploy/bootstrap.sh -o /tmp/bootstrap.sh
+#   bash /tmp/bootstrap.sh
 #
-# ...or clone first and run ./deploy/bootstrap.sh. Afterwards you only ever run deploy.sh.
+# DOWNLOAD THEN RUN - deliberately NOT `curl ... | bash`. Piping makes stdin the pipe, so
+# sudo has no terminal to prompt for a password on and dies with "a terminal is required to
+# read the password" before this script does anything at all. The guard below catches that
+# case explicitly, because the raw sudo error points at the wrong thing entirely.
+#
+# Afterwards you only ever run deploy.sh.
 #
 # Installs Docker, adds swap, clones the repo to /opt/dotnetai, and leaves you one step
 # from deploying: filling in .env.
@@ -22,6 +28,17 @@ warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 [[ $EUID -ne 0 ]] || die "run this as your normal user, not root — it uses sudo where needed"
+
+# Passwordless sudo needs no terminal, so only complain when a password IS required and
+# there is no tty to type it on.
+if ! sudo -n true 2>/dev/null && [[ ! -t 0 ]]; then
+    die "sudo needs a password but stdin is not a terminal.
+    You have almost certainly run this as 'curl ... | bash'. Download it first:
+
+      curl -fsSL https://raw.githubusercontent.com/dyeprey/dotnetai/main/deploy/bootstrap.sh -o /tmp/bootstrap.sh
+      bash /tmp/bootstrap.sh"
+fi
+
 sudo -v || die "this needs sudo"
 
 # ---------------------------------------------------------------------------

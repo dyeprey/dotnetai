@@ -162,7 +162,7 @@ services:
       api:
         condition: service_healthy
     environment:
-      # The API's own hostname, e.g. api.example.com — a subdomain distinct from wherever
+      # The API's own hostname, e.g. zanet.gabbex.com — a subdomain distinct from wherever
       # Firebase serves the SPA. A bare domain makes Caddy fetch a Let's Encrypt certificate
       # on its own; ":80" serves plain HTTP with no certificate, which is useful for a local
       # smoke test and unusable with a Firebase-hosted SPA.

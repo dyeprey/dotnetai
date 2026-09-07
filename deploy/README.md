@@ -11,7 +11,7 @@ Two halves, deployed separately:
 ```
    ┌──────────────────────────┐          ┌───────────────────────────────┐
    │   Firebase Hosting       │          │   DigitalOcean droplet        │
-   │   your-project.web.app   │          │   api.example.com             │
+   │   your-project.web.app   │          │   zanet.gabbex.com             │
    │                          │          │                               │
    │   the built SPA          │          │  ┌────────────────────────┐   │
    │   (static files, HTTPS)  │          │  │ caddy   :80 :443       │   │
@@ -77,24 +77,48 @@ The two sides name each other, which is the easiest thing in this deploy to get 
 
 ## 2. Point DNS at it
 
-An **A record** for the API's subdomain → the droplet's IPv4 address. Let it propagate
-before you deploy: Caddy proves domain ownership over ports 80 and 443 the first time it
-starts, and if the record is not live yet, issuance fails and you wait out a retry backoff.
+`gabbex.com` is on Cloudflare nameservers, so add the record there:
+
+| Type | Name | Content | Proxy status |
+|---|---|---|---|
+| A | `zanet` | `134.209.108.141` | **DNS only (grey cloud)** |
+
+> ### The proxy toggle is the important part
+>
+> Leave it **grey**, not orange. Cloudflare's proxy breaks two things this app depends on:
+>
+> **1. Certificates.** With the proxy on, Cloudflare terminates TLS itself and serves its own
+> certificate. Caddy's TLS-ALPN challenge then never reaches this droplet, so ACME fails and
+> Caddy retries in a loop — while the site *appears* to work over HTTPS, because you are
+> seeing Cloudflare's certificate, not yours.
+>
+> **2. Streaming.** `/chat` is Server-Sent Events. Cloudflare's free plan buffers proxied
+> responses and caps a connection at 100 seconds, so a long model reply arrives all at once
+> or is cut off mid-stream. Everything the Caddyfile's `flush_interval -1` exists to
+> guarantee is undone one hop upstream.
+>
+> Grey cloud means Cloudflare answers DNS and nothing else: Caddy gets a real Let's Encrypt
+> certificate, streaming works, and the API sees real client IPs.
+
+Verify before deploying — Caddy proves domain ownership the first time it starts, and if the
+record is not live yet, issuance fails and you wait out a retry backoff:
 
 ```bash
-dig +short api.example.com    # must print the droplet's IP before you continue
+dig +short zanet.gabbex.com     # must print 134.209.108.141
 ```
-
-You can skip this for a first smoke test by setting `API_DOMAIN=:80` and hitting the bare
-IP — but the Firebase-hosted SPA cannot talk to an HTTP API (mixed content), so a real
-deployment needs the domain.
 
 ## 3. Bootstrap the droplet (once)
 
 ```bash
 ssh jeffrey@<droplet-ip>
-curl -fsSL https://raw.githubusercontent.com/dyeprey/dotnetai/main/deploy/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dyeprey/dotnetai/main/deploy/bootstrap.sh -o /tmp/bootstrap.sh
+bash /tmp/bootstrap.sh
 ```
+
+> **Download then run — not `curl … | bash`.** Piping makes stdin the pipe, so `sudo` has no
+> terminal to prompt on and fails with *"a terminal is required to read the password"*
+> before the script does anything. The error names sudo, so it reads like a permissions
+> problem rather than a plumbing one.
 
 That adds 2 GB of swap (with `vm.swappiness=10`, so swap stays a safety net rather than a
 routine tier of memory), installs Docker, puts you in the `docker` group, caps container
@@ -123,7 +147,7 @@ openssl rand -base64 48
 Then edit `.env`:
 
 ```ini
-API_DOMAIN=api.example.com
+API_DOMAIN=zanet.gabbex.com
 ACME_EMAIL=you@example.com
 
 # Firebase serves every project on BOTH of these and the SPA works on either, so list both
@@ -180,11 +204,11 @@ backs up the database, applies migrations, starts the API, verifies it over TLS,
 **rolls back to the previous image if anything fails**.
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://api.example.com/auth/me
+curl -s -o /dev/null -w '%{http_code}\n' https://zanet.gabbex.com/auth/me
 # 401 — the API is up, reachable over TLS, and enforcing auth
 
 # CORS: the SPA's origin must come back echoed in Access-Control-Allow-Origin.
-curl -si -X OPTIONS https://api.example.com/auth/me \
+curl -si -X OPTIONS https://zanet.gabbex.com/auth/me \
   -H 'Origin: https://your-project.web.app' \
   -H 'Access-Control-Request-Method: GET' \
   -H 'Access-Control-Request-Headers: authorization' | grep -i access-control-allow-origin
@@ -241,7 +265,7 @@ cp .env.production.example .env.production
 
 ```ini
 # .env.production — absolute, https, no trailing slash
-VITE_API_URL=https://api.example.com
+VITE_API_URL=https://zanet.gabbex.com
 ```
 
 ```bash
@@ -373,7 +397,15 @@ at the edge, in Caddy, which is where they belong. Do **not** "fix" it by settin
 `ASPNETCORE_HTTPS_PORTS` — that makes the API redirect requests Caddy has already decrypted,
 and the browser sees a redirect loop.
 
-**No certificate.** Check the A record resolves to this droplet (`dig +short api.example.com`),
+**No certificate, but the site loads over HTTPS anyway.** Classic Cloudflare orange-cloud
+symptom: you are seeing Cloudflare's certificate while Caddy fails ACME behind it. Check
+`docker compose logs caddy` for repeated challenge failures, and set the record to DNS only.
+
+**Chat replies arrive all at once, or cut off after ~100 seconds.** Also the Cloudflare
+proxy — it buffers responses and caps connection duration on the free plan. Set the record
+to DNS only (grey cloud).
+
+**No certificate.** Check the A record resolves to this droplet (`dig +short zanet.gabbex.com`),
 that ports 80 and 443 are open in the DigitalOcean firewall, then `docker compose logs caddy`.
 Let's Encrypt allows **5 duplicate certificates per week**; the `caddy-data` volume exists so
 redeploys reuse the certificate you already have, so never delete that volume casually.
