@@ -11,7 +11,7 @@ Two halves, deployed separately:
 ```
    ┌──────────────────────────┐          ┌───────────────────────────────┐
    │   Firebase Hosting       │          │   DigitalOcean droplet        │
-   │   your-project.web.app   │          │   zanet.gabbex.com             │
+   │   zane.gabbex.com        │          │   zanet.gabbex.com            │
    │                          │          │                               │
    │   the built SPA          │          │  ┌────────────────────────┐   │
    │   (static files, HTTPS)  │          │  │ caddy   :80 :443       │   │
@@ -122,7 +122,8 @@ bash /tmp/bootstrap.sh
 
 That adds 2 GB of swap (with `vm.swappiness=10`, so swap stays a safety net rather than a
 routine tier of memory), installs Docker, puts you in the `docker` group, caps container
-log rotation so logs cannot fill a small disk, clones the repo to `/opt/dotnetai`, and
+log rotation so logs cannot fill a small disk, clones the repo to `/opt/dotnetai` (chowned to you, so no sudo afterwards — set
+`APP_DIR=~/dotnetai` if you prefer your home directory), and
 creates `.env` from the template.
 
 **Log out and back in afterwards** — group membership only applies to new logins, and
@@ -150,11 +151,13 @@ Then edit `.env`:
 API_DOMAIN=zanet.gabbex.com
 ACME_EMAIL=you@example.com
 
-# Firebase serves every project on BOTH of these and the SPA works on either, so list both
-# or the site breaks on whichever one you did not test. No trailing slash.
-WEB_ORIGIN=https://your-project.web.app
-WEB_ORIGIN_ALT=https://your-project.firebaseapp.com
-WEB_ORIGIN_CUSTOM=            # a custom domain on Firebase Hosting, if you have one
+# All THREE origins the SPA is reachable on. Firebase serves every project on both of its
+# default domains whether or not you use them, and the custom domain is a third — the site
+# works on all three, so all three must be listed or it breaks on whichever one you did not
+# test. No trailing slash.
+WEB_ORIGIN=https://dotnetchat-549c6.web.app
+WEB_ORIGIN_ALT=https://dotnetchat-549c6.firebaseapp.com
+WEB_ORIGIN_CUSTOM=https://zane.gabbex.com
 
 JWT_KEY=<the openssl output>
 OPENAI_API_KEY=sk-...
@@ -209,7 +212,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://zanet.gabbex.com/auth/me
 
 # CORS: the SPA's origin must come back echoed in Access-Control-Allow-Origin.
 curl -si -X OPTIONS https://zanet.gabbex.com/auth/me \
-  -H 'Origin: https://your-project.web.app' \
+  -H 'Origin: https://zane.gabbex.com' \
   -H 'Access-Control-Request-Method: GET' \
   -H 'Access-Control-Request-Headers: authorization' | grep -i access-control-allow-origin
 ```

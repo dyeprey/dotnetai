@@ -149,5 +149,8 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
+          # $APP_DIR is deliberately NOT single-quoted inside the remote command: the
+          # default is ~/dotnetai, and a tilde inside quotes is a literal directory named
+          # "~", not the home directory. Letting the remote shell expand it is the point.
           ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes "$USER@$HOST" \
-            "cd '$APP_DIR' && IMAGE_TAG='sha-${{ github.sha }}' ./deploy/deploy.sh"
+            "cd $APP_DIR && IMAGE_TAG='sha-${{ github.sha }}' ./deploy/deploy.sh"

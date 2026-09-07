@@ -103,6 +103,13 @@ if [[ -d "$APP_DIR/.git" ]]; then
     ok "$APP_DIR already cloned"
 else
     log "Cloning into $APP_DIR"
+    # /opt is the FHS location for add-on application packages, and it keeps the deployment
+    # independent of any one user account. The chown is what makes that costless afterwards:
+    # every later `git pull` and `deploy.sh` runs as you, with no sudo.
+    #
+    # Override with APP_DIR=~/dotnetai if you would rather keep it in your home directory -
+    # nothing here depends on the location. deploy.sh resolves the repo relative to its own
+    # path, not from a hard-coded root.
     sudo mkdir -p "$APP_DIR"
     sudo chown "$USER:$USER" "$APP_DIR"
     # HTTPS rather than SSH: the droplet has no deploy key, and it only ever needs to read.
