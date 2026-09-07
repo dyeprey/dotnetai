@@ -1,0 +1,171 @@
+name: dotnetai
+
+# =============================================================================
+# The ASP.NET Core API only. The React SPA is built separately and deployed to
+# Firebase Hosting — see deploy/README.md.
+#
+# That split is what makes CORS load-bearing here. The browser runs the SPA on
+# a Firebase origin and the API answers on this droplet, so every call the SPA
+# makes is cross-origin and only succeeds because this API says the Firebase
+# origin is welcome. Get Cors__AllowedOrigins wrong and the SPA fails with a
+# console message that names no cause.
+# =============================================================================
+
+x-api-image: &api-image
+  image: dotnetai-api:latest
+  build:
+    # The repo root — this compose file now lives beside the Dockerfile it builds.
+    context: .
+    dockerfile: Dockerfile
+
+services:
+  # ---------------------------------------------------------------------------
+  # SCHEMA MIGRATION — runs to completion, then exits
+  # ---------------------------------------------------------------------------
+  #
+  # Program.cs never calls Database.Migrate(), which is the right choice: an app that
+  # migrates itself on boot needs write-DDL rights forever, and with more than one replica
+  # they race each other. So something has to apply the schema, and this is it.
+  #
+  # A ONE-SHOT SERVICE, not an entrypoint script, because it makes the deploy legible.
+  # `docker compose logs api-migrate` shows exactly which migrations ran; a failed migration
+  # is a failed container with a non-zero exit code, and `service_completed_successfully`
+  # below means the API is never started against a schema that did not finish applying.
+  api-migrate:
+    <<: *api-image
+    container_name: dotnetai-api-migrate
+    restart: "no" # It is SUPPOSED to exit. `unless-stopped` here would restart it forever.
+
+    # ENTRYPOINT, NOT COMMAND. The image's ENTRYPOINT is `dotnet dotnetai.Api.dll`, and
+    # compose's `command:` replaces CMD while leaving ENTRYPOINT intact — so `command:` here
+    # would run `dotnet dotnetai.Api.dll ./efbundle --connection ...`, quietly starting a
+    # second copy of the API instead of migrating anything. Overriding `entrypoint:` is what
+    # actually swaps the executable.
+    entrypoint: ["./efbundle"]
+    command:
+      - --connection
+      - Data Source=/data/dotnetai.db
+    volumes:
+      - api-data:/data
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # THE ASP.NET CORE API
+  # ---------------------------------------------------------------------------
+  api:
+    <<: *api-image
+    container_name: dotnetai-api
+    restart: unless-stopped
+    depends_on:
+      api-migrate:
+        condition: service_completed_successfully
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_HTTP_PORTS: "8080"
+
+      # The double underscore is .NET's environment-variable spelling of a nested config
+      # key: ConnectionStrings__AppDb overrides ConnectionStrings:AppDb from appsettings.json.
+      # /data is the mounted volume, so the database outlives every container.
+      ConnectionStrings__AppDb: "Data Source=/data/dotnetai.db"
+
+      # `:?` makes compose REFUSE TO START with a message naming the variable, rather than
+      # booting a broken stack. Without it a missing key surfaces as a startup crash loop.
+      Jwt__Key: "${JWT_KEY:?JWT_KEY is not set - generate one with: openssl rand -base64 48}"
+      Jwt__Issuer: ${JWT_ISSUER:-dotnetai.Api}
+      Jwt__Audience: ${JWT_AUDIENCE:-dotnetai.Client}
+
+      OpenAI__ApiKey: "${OPENAI_API_KEY:?OPENAI_API_KEY is not set - get one from platform.openai.com}"
+      OpenAI__Model: ${OPENAI_MODEL:-gpt-4o-mini}
+      OpenAI__RequestsPerMinute: ${OPENAI_REQUESTS_PER_MINUTE:-20}
+
+      # ---------------------------------------------------------------------
+      # CORS — the SPA's origins, and nothing else
+      # ---------------------------------------------------------------------
+      #
+      # Firebase Hosting serves every project on TWO default domains, and the SPA works on
+      # both, so both must be listed or the site breaks on whichever one you did not test.
+      # A custom domain is a third entry.
+      #
+      # THREE SEPARATE INDICES, not one comma-separated value: Cors:AllowedOrigins is a
+      # JSON array, and .NET's environment-variable provider addresses array elements by
+      # index. "a,b" arrives as a single origin string containing a comma, which matches
+      # nothing and produces a CORS failure that looks like the policy was ignored.
+      #
+      # Unused indices are left empty. An empty string is never equal to a real Origin
+      # header, so a blank entry is inert rather than a wildcard.
+      Cors__AllowedOrigins__0: "${WEB_ORIGIN:?WEB_ORIGIN is not set - e.g. https://your-project.web.app}"
+      Cors__AllowedOrigins__1: "${WEB_ORIGIN_ALT:-}"
+      Cors__AllowedOrigins__2: "${WEB_ORIGIN_CUSTOM:-}"
+
+    volumes:
+      - api-data:/data
+      # The Data Protection keyring — see the API Dockerfile for why it must outlive the
+      # container rather than being recreated on each deploy.
+      - api-keys:/home/app/.aspnet
+
+    # NO `ports:`. The API is reachable only from the Docker network, through Caddy. Publish
+    # 8080 and the droplet's firewall becomes the only thing between the open internet and
+    # an unencrypted API — bypassing TLS, the security headers, and the edge entirely.
+    expose:
+      - "8080"
+
+    # /auth/me with no token returns 401, which proves the whole pipeline is up: Kestrel is
+    # listening, routing matched, and the auth middleware ran. A 401 is therefore SUCCESS
+    # here — hence --fail is absent and the check is on the status code, not on curl's
+    # opinion of it. 127.0.0.1 rather than localhost, which resolves to ::1 first.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/auth/me | grep -q 401"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # CADDY — TLS termination and the only published ports
+  # ---------------------------------------------------------------------------
+  #
+  # NOT OPTIONAL once the SPA lives on Firebase. Firebase Hosting is HTTPS-only, and a
+  # browser refuses to let an HTTPS page call an HTTP endpoint — the request is blocked as
+  # mixed content before it leaves the browser, with no preflight and nothing in the API's
+  # logs. So the API needs a real certificate, and this is what obtains and renews it.
+  caddy:
+    image: caddy:2-alpine
+    container_name: dotnetai-caddy
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # The API's own hostname, e.g. api.example.com — a subdomain distinct from wherever
+      # Firebase serves the SPA. A bare domain makes Caddy fetch a Let's Encrypt certificate
+      # on its own; ":80" serves plain HTTP with no certificate, which is useful for a local
+      # smoke test and unusable with a Firebase-hosted SPA.
+      SITE_ADDRESS: "${API_DOMAIN:-:80}"
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # ISSUED CERTIFICATES LIVE HERE. Without this volume every `compose up` starts with an
+      # empty store and asks Let's Encrypt for a fresh certificate — and their rate limit is
+      # 5 duplicate certificates per week. A few redeploys and issuance is blocked for days.
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - backend
+
+volumes:
+  api-data: # the SQLite database
+  api-keys: # the ASP.NET Core Data Protection keyring
+  caddy-data: # certificates and ACME account keys
+  caddy-config:
+
+networks:
+  backend:
+    driver: bridge

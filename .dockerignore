@@ -12,3 +12,22 @@
 .vs/
 .idea/
 .DS_Store
+
+# The entire repo history. Not a build input, and `COPY . .` would write every commit into
+# an image layer — needless weight, and a copy of anything that was ever committed.
+.git
+.gitignore
+
+# DEPLOYMENT CONFIG — must never enter the build context.
+#
+# .env holds the JWT signing key and the OpenAI key. The build stage does `COPY . .`, so
+# without this line those secrets are written into an image layer — where they survive even
+# though the final stage never copies them forward, and `docker history` will show them.
+.env
+.env.*
+!.env.example
+
+# Not inputs to the build; excluding them keeps the context small and stops an edit to the
+# compose file or the docs from invalidating the Docker layer cache.
+docker-compose.yml
+deploy/

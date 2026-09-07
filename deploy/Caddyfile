@@ -1,0 +1,72 @@
+# =============================================================================
+# TLS termination for the API. This is the only container with published ports;
+# the API itself is reachable only on the internal Docker network.
+#
+# The React SPA is NOT served from here — it lives on Firebase Hosting. This
+# hostname answers for the API alone, which is why every route below proxies
+# straight to it with no path rewriting.
+# =============================================================================
+
+{
+	# Where Let's Encrypt sends expiry warnings. Caddy obtains and renews certificates
+	# automatically, with no cron job and no certbot, as long as SITE_ADDRESS is a real
+	# domain pointed at this droplet and ports 80 and 443 are reachable.
+	#
+	# When SITE_ADDRESS is ":80" (the local smoke-test case) none of this runs — Caddy
+	# serves plain HTTP and never contacts an ACME server.
+	email {$ACME_EMAIL:admin@example.com}
+}
+
+{$SITE_ADDRESS::80} {
+	# One backend, every path. The SPA calls https://this-host/auth/login and
+	# https://this-host/chat directly, so there is no prefix to add or strip — the URL the
+	# browser requests is the URL the API routes on.
+	reverse_proxy api:8080 {
+		# STREAMING. /chat is Server-Sent Events: the API writes tokens as the model
+		# produces them, and the reply is only useful because it arrives progressively. A
+		# proxy that buffers would hold the whole response and release it at once, turning
+		# a live stream into a long pause followed by a wall of text.
+		#
+		# Caddy does detect text/event-stream and stop buffering on its own. It is written
+		# out because that is an implicit behaviour the deployment depends on, and -1
+		# (flush immediately, never buffer) states the requirement rather than trusting a
+		# default to keep working.
+		flush_interval -1
+
+		# The API sits behind this proxy and sees only Caddy's connection. This carries the
+		# real client's address through, so logs are about the caller rather than the proxy.
+		header_up X-Real-IP {remote_host}
+	}
+
+	# NO `encode`. Every response here is either small JSON or an SSE stream, and
+	# compressing a stream reintroduces exactly the buffering that flush_interval just
+	# disabled. There is nothing to gain and a live feature to lose.
+
+	header {
+		# Cuts off MIME-sniffing and framing, and stops the full URL leaking to third-party
+		# sites in the Referer header.
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+
+		# Tells browsers to refuse plain HTTP to this host for a year. Only meaningful once
+		# a real certificate is in place; ignored over an insecure connection, so it is
+		# harmless on the :80 profile.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		# Nothing here should advertise what it is running.
+		-Server
+	}
+
+	# DELIBERATELY NOT SET HERE: any Access-Control-* header.
+	#
+	# The API owns CORS. It reads Cors:AllowedOrigins, decides whether a given Origin is
+	# welcome, and echoes back exactly one Access-Control-Allow-Origin. If this proxy added
+	# its own the response would carry the header twice, and browsers treat a duplicated
+	# Allow-Origin as invalid — so a well-meant `header Access-Control-Allow-Origin *`
+	# here would break every cross-origin call while appearing to permit all of them.
+	log {
+		output stdout
+		format console
+	}
+}

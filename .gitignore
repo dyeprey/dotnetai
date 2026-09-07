@@ -13,3 +13,11 @@ obj/
 
 # Note: appsettings.Development.json is NOT ignored, because it holds no secrets.
 # Jwt:Key lives in user-secrets (~/.microsoft/usersecrets/), outside the repo entirely.
+
+# DEPLOYMENT SECRETS. .env now lives in this repo and holds the JWT signing key and the
+# OpenAI API key. .env.example is the committed template; the real file never is.
+.env
+.env.local
+
+# Database backups produced by the command in deploy/README.md.
+dotnetai-*.db
